@@ -43,11 +43,13 @@ pub fn cmd_patch(args: PatchArgs) -> Result<()> {
         }),
     )?;
     r2.cmd("aa")?;
-    let mut patched_bytes=HashSet::new();
+    let mut patched_bytes = HashSet::new();
     let sections = json_get!(r2.cmdj("iSj")?, Array)
         .iter()
         .find(|v| {
-            v.get("name").and_then(|n|n.as_str()).map_or(false, |s|s==".text")
+            v.get("name")
+                .and_then(|n| n.as_str())
+                .map_or(false, |s| s == ".text")
         })
         .ok_or(R2Error {})?
         .clone();
@@ -71,14 +73,19 @@ pub fn cmd_patch(args: PatchArgs) -> Result<()> {
                 if bb_offset < text_start || bb_offset > text_start + text_size {
                     continue;
                 }
-                if patched_bytes.insert(bb_offset){
-                    let old_byte = u8::from_str_radix(r2.cmd(format!("pB 1 @ {bb_offset}").as_str())?.as_str().trim(), 2)?;
+                if patched_bytes.insert(bb_offset) {
+                    let old_byte = u8::from_str_radix(
+                        r2.cmd(format!("pB 1 @ {bb_offset}").as_str())?
+                            .as_str()
+                            .trim(),
+                        2,
+                    )?;
                     con.hset(&full_path, format!("{bb_offset}"), format!("{old_byte}"))?;
                 }
             }
         }
     }
-    for bb_offset in patched_bytes{
+    for bb_offset in patched_bytes {
         r2.cmd(format!("wx cc @ {bb_offset}").as_str())?;
     }
 

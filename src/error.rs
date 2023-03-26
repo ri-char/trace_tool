@@ -13,3 +13,19 @@ impl std::fmt::Debug for R2Error {
 }
 
 impl std::error::Error for R2Error {}
+
+pub struct PtraceError {}
+
+impl std::fmt::Display for PtraceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ptrace swpan error")
+    }
+}
+
+impl std::fmt::Debug for PtraceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PtraceError").finish()
+    }
+}
+
+impl std::error::Error for PtraceError {}

@@ -1,8 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::CString,
+    io::Read,
     path::PathBuf,
-    process::exit, io::Read,
+    process::exit,
 };
 
 use anyhow::Result;
@@ -16,7 +17,7 @@ use nix::{
 };
 use redis::Commands;
 
-use crate::RunArgs;
+use crate::{error::PtraceError, RunArgs};
 
 pub fn cmd_run(args: RunArgs) -> Result<()> {
     let mut cstr_args: Vec<CString> = Vec::new();
@@ -42,25 +43,30 @@ fn debug(child: Pid, output_path: Option<PathBuf>, db: String) -> Result<i32> {
     let mut conn = client.get_connection()?;
 
     let mut record_map: HashMap<String, HashSet<usize>> = HashMap::new();
-    let mut first_event = true;
     let mut exit_code = 0i32;
     let mut active_pid: HashSet<Pid> = HashSet::new();
     active_pid.insert(child);
+
+    let wait_status = wait()?;
+    if let WaitStatus::Stopped(_, Signal::SIGTRAP) = wait_status {
+    } else {
+        log::error!("Ptrace error");
+        return Err(PtraceError {}.into());
+    }
+    ptrace::setoptions(
+        child,
+        ptrace::Options::PTRACE_O_TRACECLONE
+            | ptrace::Options::PTRACE_O_TRACEEXEC
+            | ptrace::Options::PTRACE_O_TRACEFORK
+            | ptrace::Options::PTRACE_O_TRACEVFORK,
+    )?;
+    ptrace::cont(child, None)?;
+
     loop {
         let wait_status = wait()?;
-        if first_event {
-            ptrace::setoptions(
-                child,
-                ptrace::Options::PTRACE_O_TRACECLONE
-                    | ptrace::Options::PTRACE_O_TRACEEXEC
-                    | ptrace::Options::PTRACE_O_TRACEFORK
-                    | ptrace::Options::PTRACE_O_TRACEVFORK,
-            )?;
-            first_event = false;
-        }
         match wait_status {
             WaitStatus::Exited(pid, code) => {
-                log::debug!("===Process {pid} exited with {code}===");
+                log::debug!("[{pid}] Exited with {code}");
                 active_pid.remove(&pid);
                 if pid == child {
                     exit_code = code;
@@ -70,7 +76,7 @@ fn debug(child: Pid, output_path: Option<PathBuf>, db: String) -> Result<i32> {
                 }
             }
             WaitStatus::Signaled(pid, sig, _) => {
-                log::debug!("===Process {pid} exited with {sig}===");
+                log::debug!("[{pid}] Exited with {sig}");
                 active_pid.remove(&pid);
                 if pid == child {
                     exit_code = 0xff;
@@ -80,12 +86,14 @@ fn debug(child: Pid, output_path: Option<PathBuf>, db: String) -> Result<i32> {
                 }
             }
             WaitStatus::Stopped(pid, Signal::SIGTRAP) => {
+                let mut fix = false;
                 let mut reg = ptrace::getregs(pid)?;
                 reg.rip -= 1;
                 if let Some((module, offset)) = get_module_and_offset(pid, reg.rip)? {
                     if let Some(initial_byte) = get_initial_byte(&module, offset, &mut conn)? {
                         let aligned_ip = reg.rip & !7u64;
-                        let mut code_bytes: [u8; 8] = ptrace::read(pid, aligned_ip as AddressType)?.to_ne_bytes();
+                        let mut code_bytes: [u8; 8] =
+                            ptrace::read(pid, aligned_ip as AddressType)?.to_ne_bytes();
                         if code_bytes[(reg.rip - aligned_ip) as usize] == 0xcc {
                             code_bytes[(reg.rip - aligned_ip) as usize] = initial_byte;
                             let new_bytes = u64::from_ne_bytes(code_bytes);
@@ -106,24 +114,29 @@ fn debug(child: Pid, output_path: Option<PathBuf>, db: String) -> Result<i32> {
                                 trigger_set.insert(offset);
                                 record_map.insert(module.clone(), trigger_set);
                             }
+                            fix = true;
                         }
                     }
                 }
-                ptrace::cont(pid, None)?;
+                ptrace::cont(pid, if fix { None } else { Some(Signal::SIGTRAP) })?;
             }
             WaitStatus::Stopped(pid, Signal::SIGSTOP) => {
+                log::debug!("[{pid}] Stoped by SIGSTOP");
                 ptrace::cont(pid, None)?;
             }
             WaitStatus::Stopped(pid, signal) => {
                 // pass other signal to process
-                if signal==Signal::SIGSEGV {
+                if signal == Signal::SIGSEGV {
                     let regs = ptrace::getregs(pid)?;
-                    log::debug!("[{pid}] SIGSEGV rip: {:x}", regs.rip);
-                    let mut buf:String=String::new();
-                    std::fs::OpenOptions::new().read(true).open(format!("/proc/{pid}/maps"))?.read_to_string(&mut buf)?;
+                    log::debug!("[{pid}] Stoped by {signal} rip: {:x}", regs.rip);
+                    let mut buf: String = String::new();
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .open(format!("/proc/{pid}/maps"))?
+                        .read_to_string(&mut buf)?;
                     log::trace!("{buf}");
-                }else{
-                    log::debug!("[{pid}] Process {pid} stoped by {signal}");
+                } else {
+                    log::debug!("[{pid}] Stoped by {signal}");
                 }
                 if let Err(nix::errno::Errno::ESRCH) = ptrace::cont(pid, Some(signal)) {
                     active_pid.remove(&pid);
@@ -135,22 +148,31 @@ fn debug(child: Pid, output_path: Option<PathBuf>, db: String) -> Result<i32> {
                     }
                 }
             }
-            WaitStatus::PtraceEvent(pid, _, event) => {
-                match event {
-                    nix::libc::PTRACE_EVENT_FORK
-                    | nix::libc::PTRACE_EVENT_VFORK
-                    | nix::libc::PTRACE_EVENT_CLONE
-                    | nix::libc::PTRACE_EVENT_EXEC => {
-                        let new_pid=ptrace::getevent(pid)? as i32;
-                        log::debug!("[{pid}] PtraceEvent {event} create ");
-                        active_pid.insert(Pid::from_raw(new_pid));
-                        ptrace::cont(pid, None)?;
-                    }
-                    _ => {
-                        ptrace::cont(pid, None)?;
-                    }
+            WaitStatus::PtraceEvent(pid, _, event) => match event {
+                nix::libc::PTRACE_EVENT_FORK
+                | nix::libc::PTRACE_EVENT_VFORK
+                | nix::libc::PTRACE_EVENT_CLONE
+                | nix::libc::PTRACE_EVENT_EXEC => {
+                    let new_pid = ptrace::getevent(pid)? as i32;
+                    log::debug!(
+                        "[{pid}] PtraceEvent {} {new_pid}",
+                        match event {
+                            nix::libc::PTRACE_EVENT_FORK => "fork",
+                            nix::libc::PTRACE_EVENT_VFORK => "vfork",
+                            nix::libc::PTRACE_EVENT_CLONE => "clone",
+                            nix::libc::PTRACE_EVENT_EXEC => "exec",
+                            _ => unreachable!(),
+                        }
+                    );
+                    active_pid.insert(Pid::from_raw(new_pid));
+                    ptrace::cont(pid, None)?;
                 }
-            }
+                _ => {
+                    let content = ptrace::getevent(pid)?;
+                    log::debug!("[{pid}] PtraceEvent {event}({content})",);
+                    ptrace::cont(pid, None)?;
+                }
+            },
             WaitStatus::Continued(pid) | WaitStatus::PtraceSyscall(pid) => {
                 ptrace::cont(pid, None)?;
             }
@@ -183,7 +205,7 @@ fn print_coverage(
             trigger_bb,
             total_bb,
             (trigger_bb as f32) / (total_bb as f32) * 100f32
-        )
+        );
     }
     Ok(())
 }

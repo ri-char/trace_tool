@@ -1,8 +1,8 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+mod error;
 mod patch;
 mod run;
-mod error;
 
 #[derive(Parser)]
 #[command(author="riChar", version, about="A tool to get coverage", long_about = None)]
@@ -25,7 +25,7 @@ pub struct RunArgs {
     #[arg(short, long)]
     pub output: Option<std::path::PathBuf>,
     /// redis url
-    #[arg(long, default_value="redis://127.0.0.1/")]
+    #[arg(long, default_value = "redis://127.0.0.1/")]
     pub db: String,
     /// Command to run
     pub cmd: Vec<String>,
@@ -36,10 +36,10 @@ pub struct PatchArgs {
     /// File to be patched
     pub elf: String,
     /// redis url
-    #[arg(long, default_value="redis://127.0.0.1/")]
+    #[arg(long, default_value = "redis://127.0.0.1/")]
     pub db: String,
     /// r2 command
-    #[arg(long, default_value="r2")]
+    #[arg(long, default_value = "r2")]
     pub r2: String,
 }
 
