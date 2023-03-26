@@ -1,7 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::CString,
-    path::PathBuf, process::exit,
+    path::PathBuf,
+    process::exit, io::Read,
 };
 
 use anyhow::Result;
@@ -13,11 +14,11 @@ use nix::{
     },
     unistd::{execv, fork, ForkResult, Pid},
 };
+use redis::Commands;
 
-use crate::{RunArgs, patch::PatchDB};
+use crate::RunArgs;
 
 pub fn cmd_run(args: RunArgs) -> Result<()> {
-    let initial_byte_map: PatchDB = crate::patch::read_patch_db(&args.db)?;
     let mut cstr_args: Vec<CString> = Vec::new();
     for arg in args.cmd {
         cstr_args.push(CString::new(arg)?)
@@ -25,9 +26,9 @@ pub fn cmd_run(args: RunArgs) -> Result<()> {
 
     match unsafe { fork() }? {
         ForkResult::Parent { child } => {
-            let exit_code=debug(child, &initial_byte_map, args.output)?;
+            let exit_code = debug(child, args.output, args.db)?;
             exit(exit_code);
-        },
+        }
         ForkResult::Child => {
             ptrace::traceme()?;
             execv(cstr_args[0].as_c_str(), cstr_args.as_slice())?;
@@ -36,14 +37,13 @@ pub fn cmd_run(args: RunArgs) -> Result<()> {
     }
 }
 
-fn debug(
-    child: Pid,
-    initial_byte_map: &PatchDB,
-    output_path: Option<PathBuf>,
-) -> Result<i32> {
+fn debug(child: Pid, output_path: Option<PathBuf>, db: String) -> Result<i32> {
+    let client = redis::Client::open(db)?;
+    let mut conn = client.get_connection()?;
+
     let mut record_map: HashMap<String, HashSet<usize>> = HashMap::new();
     let mut first_event = true;
-    let mut exit_code=0i32;
+    let mut exit_code = 0i32;
     let mut active_pid: HashSet<Pid> = HashSet::new();
     active_pid.insert(child);
     loop {
@@ -60,20 +60,22 @@ fn debug(
         }
         match wait_status {
             WaitStatus::Exited(pid, code) => {
+                log::debug!("===Process {pid} exited with {code}===");
                 active_pid.remove(&pid);
-                if pid==child {
-                    exit_code=code;
+                if pid == child {
+                    exit_code = code;
                 }
-                if active_pid.len() == 0 {
+                if active_pid.is_empty() {
                     break;
                 }
             }
-            WaitStatus::Signaled(pid, _, _) => {
+            WaitStatus::Signaled(pid, sig, _) => {
+                log::debug!("===Process {pid} exited with {sig}===");
                 active_pid.remove(&pid);
-                if pid==child {
-                    exit_code=0xff;
+                if pid == child {
+                    exit_code = 0xff;
                 }
-                if active_pid.len() == 0 {
+                if active_pid.is_empty() {
                     break;
                 }
             }
@@ -81,28 +83,30 @@ fn debug(
                 let mut reg = ptrace::getregs(pid)?;
                 reg.rip -= 1;
                 if let Some((module, offset)) = get_module_and_offset(pid, reg.rip)? {
-                    if let Some(initial_byte) = get_initial_byte(&module, offset, initial_byte_map)
-                    {
+                    if let Some(initial_byte) = get_initial_byte(&module, offset, &mut conn)? {
                         let aligned_ip = reg.rip & !7u64;
-                        let mut code_bytes: [u8; 8] =
-                            ptrace::read(pid, aligned_ip as AddressType)?.to_ne_bytes();
-                        code_bytes[(reg.rip - aligned_ip) as usize] = initial_byte;
-                        let new_bytes = u64::from_ne_bytes(code_bytes);
-                        unsafe {
-                            ptrace::write(
-                                pid,
-                                aligned_ip as AddressType,
-                                new_bytes as *mut std::ffi::c_void,
-                            )
-                        }?;
-                        ptrace::setregs(pid, reg)?;
-                    }
-                    if let Some(trigger_set) = record_map.get_mut(&module) {
-                        trigger_set.insert(offset);
-                    } else {
-                        let mut trigger_set = HashSet::new();
-                        trigger_set.insert(offset);
-                        record_map.insert(module.clone(), trigger_set);
+                        let mut code_bytes: [u8; 8] = ptrace::read(pid, aligned_ip as AddressType)?.to_ne_bytes();
+                        if code_bytes[(reg.rip - aligned_ip) as usize] == 0xcc {
+                            code_bytes[(reg.rip - aligned_ip) as usize] = initial_byte;
+                            let new_bytes = u64::from_ne_bytes(code_bytes);
+                            log::trace!("[{pid}] new bytes {initial_byte:02x} {:x}", offset);
+
+                            unsafe {
+                                ptrace::write(
+                                    pid,
+                                    aligned_ip as AddressType,
+                                    new_bytes as *mut std::ffi::c_void,
+                                )
+                            }?;
+                            ptrace::setregs(pid, reg)?;
+                            if let Some(trigger_set) = record_map.get_mut(&module) {
+                                trigger_set.insert(offset);
+                            } else {
+                                let mut trigger_set = HashSet::new();
+                                trigger_set.insert(offset);
+                                record_map.insert(module.clone(), trigger_set);
+                            }
+                        }
                     }
                 }
                 ptrace::cont(pid, None)?;
@@ -112,22 +116,36 @@ fn debug(
             }
             WaitStatus::Stopped(pid, signal) => {
                 // pass other signal to process
-                ptrace::cont(pid, Some(signal))?;
+                if signal==Signal::SIGSEGV {
+                    let regs = ptrace::getregs(pid)?;
+                    log::debug!("[{pid}] SIGSEGV rip: {:x}", regs.rip);
+                    let mut buf:String=String::new();
+                    std::fs::OpenOptions::new().read(true).open(format!("/proc/{pid}/maps"))?.read_to_string(&mut buf)?;
+                    log::trace!("{buf}");
+                }else{
+                    log::debug!("[{pid}] Process {pid} stoped by {signal}");
+                }
+                if let Err(nix::errno::Errno::ESRCH) = ptrace::cont(pid, Some(signal)) {
+                    active_pid.remove(&pid);
+                    if pid == child {
+                        exit_code = 0xff;
+                    }
+                    if active_pid.is_empty() {
+                        break;
+                    }
+                }
             }
             WaitStatus::PtraceEvent(pid, _, event) => {
                 match event {
                     nix::libc::PTRACE_EVENT_FORK
                     | nix::libc::PTRACE_EVENT_VFORK
-                    | nix::libc::PTRACE_EVENT_CLONE => {
-                        active_pid.insert(Pid::from_raw(ptrace::getevent(pid)? as i32));
+                    | nix::libc::PTRACE_EVENT_CLONE
+                    | nix::libc::PTRACE_EVENT_EXEC => {
+                        let new_pid=ptrace::getevent(pid)? as i32;
+                        log::debug!("[{pid}] PtraceEvent {event} create ");
+                        active_pid.insert(Pid::from_raw(new_pid));
                         ptrace::cont(pid, None)?;
                     }
-                    // nix::libc::PTRACE_EVENT_EXEC => {
-                    //     // Not trace exec
-                    //     let cpid = Pid::from_raw(ptrace::getevent(pid)? as i32);
-                    //     ptrace::detach(cpid, None)?;
-                    //     active_pid.remove(&cpid);
-                    // }
                     _ => {
                         ptrace::cont(pid, None)?;
                     }
@@ -139,7 +157,7 @@ fn debug(
             WaitStatus::StillAlive => {}
         }
     }
-    print_coverage(initial_byte_map, &record_map);
+    print_coverage(&record_map, &mut conn)?;
 
     if let Some(output) = output_path {
         let file = std::fs::OpenOptions::new()
@@ -153,13 +171,13 @@ fn debug(
 }
 
 fn print_coverage(
-    initial_byte_map: &HashMap<String, HashMap<usize, u8>>,
     record_map: &HashMap<String, HashSet<usize>>,
-) {
-    for (module, bbs) in initial_byte_map {
-        let total_bb = bbs.len();
-        let trigger_bb = record_map.get(module).map_or(0, |s| s.len());
-        eprintln!(
+    conn: &mut redis::Connection,
+) -> Result<()> {
+    for (module, bbs) in record_map {
+        let total_bb = conn.hvals::<_, Vec<String>>(module)?.len();
+        let trigger_bb = bbs.len();
+        log::info!(
             "{}\t{}/{}\t{:.2}%",
             module,
             trigger_bb,
@@ -167,6 +185,7 @@ fn print_coverage(
             (trigger_bb as f32) / (total_bb as f32) * 100f32
         )
     }
+    Ok(())
 }
 
 fn get_module_and_offset(pid: Pid, addr: u64) -> Result<Option<(String, usize)>> {
@@ -186,10 +205,7 @@ fn get_module_and_offset(pid: Pid, addr: u64) -> Result<Option<(String, usize)>>
 fn get_initial_byte(
     module: &String,
     offset: usize,
-    initial_byte_map: &PatchDB,
-) -> Option<u8> {
-    return initial_byte_map
-        .get(module)
-        .and_then(|byte_map| byte_map.get(&offset))
-        .map(|n| *n);
+    conn: &mut redis::Connection,
+) -> Result<Option<u8>> {
+    Ok(conn.hget(module, offset)?)
 }
