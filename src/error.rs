@@ -29,3 +29,19 @@ impl std::fmt::Debug for PtraceError {
 }
 
 impl std::error::Error for PtraceError {}
+
+pub struct MutexError {}
+
+impl std::fmt::Display for MutexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("mutex error")
+    }
+}
+
+impl std::fmt::Debug for MutexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MutexError").finish()
+    }
+}
+
+impl std::error::Error for MutexError {}

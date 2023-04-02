@@ -2,35 +2,75 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::CString,
     io::Read,
-    path::PathBuf,
     process::exit,
+    sync::RwLock,
 };
 
 use anyhow::Result;
+use clap::__macro_refs::once_cell::sync::OnceCell;
 use nix::{
+    libc::{close, open},
     sys::{
         ptrace::{self, AddressType},
-        signal::Signal,
+        signal::{sigaction, SaFlags, SigAction, SigHandler, Signal},
+        signalfd::SigSet,
         wait::{wait, WaitStatus},
     },
-    unistd::{execv, fork, ForkResult, Pid},
+    unistd::{alarm, execv, fork, ForkResult, Pid},
 };
 use redis::Commands;
+use serde_json::json;
 
-use crate::{error::PtraceError, RunArgs};
+use crate::{
+    error::{MutexError, PtraceError},
+    RunArgs,
+};
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Copy)]
+enum ExitState {
+    Ok,
+    Crash,
+    Timeout,
+}
+
+static RECORD_MAP: OnceCell<RwLock<HashMap<String, HashSet<usize>>>> = OnceCell::new();
+static EXIT_STATE: RwLock<ExitState> = RwLock::new(ExitState::Ok);
 
 pub fn cmd_run(args: RunArgs) -> Result<()> {
     let mut cstr_args: Vec<CString> = Vec::new();
     for arg in args.cmd {
         cstr_args.push(CString::new(arg)?)
     }
+    RECORD_MAP.get_or_init(|| RwLock::new(HashMap::new()));
+
+    let sa = SigAction::new(
+        SigHandler::Handler(signal_handler),
+        SaFlags::SA_RESTART,
+        SigSet::empty(),
+    );
+
+    unsafe {
+        sigaction(Signal::SIGALRM, &sa)?;
+        sigaction(Signal::SIGTERM, &sa)?;
+    }
+
+    alarm::set(600);
 
     match unsafe { fork() }? {
         ForkResult::Parent { child } => {
-            let exit_code = debug(child, args.output, args.db)?;
-            exit(exit_code);
+            let exit_code = debug(child, args.db.as_str())?;
+            output_exit(exit_code);
         }
         ForkResult::Child => {
+            let null = CString::new("/dev/null").unwrap();
+            unsafe {
+                close(0);
+                close(1);
+                close(2);
+                open(null.as_ptr(), 2, 0);
+                open(null.as_ptr(), 0, 0);
+                open(null.as_ptr(), 0, 0);
+            }
             ptrace::traceme()?;
             execv(cstr_args[0].as_c_str(), cstr_args.as_slice())?;
             Ok(())
@@ -38,11 +78,43 @@ pub fn cmd_run(args: RunArgs) -> Result<()> {
     }
 }
 
-fn debug(child: Pid, output_path: Option<PathBuf>, db: String) -> Result<i32> {
+const ERROR_ADDR: [(&'static str, usize); 2] = [
+    // KCrashHandler::TerminateHandler
+    ("libkso.so", 0x03519150),
+    // KCrashHandler::UnexpectedHandler
+    ("libkso.so", 0x03519180),
+];
+
+const NORMAL_ADDR: [(&'static str, usize); 2] = [
+    // KApplication::exec
+    ("libetmain.so", 0x26b1266),
+    // KxApplication::messageBox
+    ("libkso.so", 0x2891c40),
+];
+
+extern "C" fn signal_handler(_: nix::libc::c_int) {
+    *EXIT_STATE.write().unwrap() = ExitState::Timeout;
+    output_exit(0xff);
+}
+
+fn output_exit(code: i32) -> ! {
+    let eexit_state = *EXIT_STATE.read().unwrap();
+    let rrecord_map = &*RECORD_MAP.get().unwrap().read().unwrap();
+    serde_json::to_writer(
+        std::io::stdout(),
+        &json!({
+            "state": eexit_state,
+            "map": rrecord_map,
+        }),
+    )
+    .unwrap();
+    exit(code);
+}
+
+fn debug(child: Pid, db: &str) -> Result<i32> {
     let client = redis::Client::open(db)?;
     let mut conn = client.get_connection()?;
 
-    let mut record_map: HashMap<String, HashSet<usize>> = HashMap::new();
     let mut exit_code = 0i32;
     let mut active_pid: HashSet<Pid> = HashSet::new();
     active_pid.insert(child);
@@ -94,28 +166,53 @@ fn debug(child: Pid, output_path: Option<PathBuf>, db: String) -> Result<i32> {
                         let aligned_ip = reg.rip & !7u64;
                         let mut code_bytes: [u8; 8] =
                             ptrace::read(pid, aligned_ip as AddressType)?.to_ne_bytes();
-                        if code_bytes[(reg.rip - aligned_ip) as usize] == 0xcc {
-                            code_bytes[(reg.rip - aligned_ip) as usize] = initial_byte;
-                            let new_bytes = u64::from_ne_bytes(code_bytes);
-                            log::trace!("[{pid}] new bytes {initial_byte:02x} {:x}", offset);
+                        code_bytes[(reg.rip - aligned_ip) as usize] = initial_byte;
+                        let new_bytes = u64::from_ne_bytes(code_bytes);
+                        log::trace!("[{pid}] patch bytes {initial_byte:02x} {module}@{offset:x}");
 
-                            unsafe {
-                                ptrace::write(
-                                    pid,
-                                    aligned_ip as AddressType,
-                                    new_bytes as *mut std::ffi::c_void,
-                                )
-                            }?;
-                            ptrace::setregs(pid, reg)?;
-                            if let Some(trigger_set) = record_map.get_mut(&module) {
-                                trigger_set.insert(offset);
-                            } else {
-                                let mut trigger_set = HashSet::new();
-                                trigger_set.insert(offset);
-                                record_map.insert(module.clone(), trigger_set);
-                            }
-                            fix = true;
+                        unsafe {
+                            ptrace::write(
+                                pid,
+                                aligned_ip as AddressType,
+                                new_bytes as *mut std::ffi::c_void,
+                            )
+                        }?;
+                        ptrace::setregs(pid, reg)?;
+                        let mut rrecord_map = RECORD_MAP
+                            .get()
+                            .ok_or(MutexError {})?
+                            .write()
+                            .map_err(|_| MutexError {})?;
+
+                        if let Some(trigger_set) = (*rrecord_map).get_mut(&module) {
+                            trigger_set.insert(offset);
+                        } else {
+                            let mut trigger_set = HashSet::new();
+                            trigger_set.insert(offset);
+                            rrecord_map.insert(module.clone(), trigger_set);
                         }
+                        fix = true;
+                    }
+                    for (target_module, target_addr) in ERROR_ADDR {
+                        if module.ends_with(target_module) && offset == target_addr {
+                            log::debug!("[{pid}] crash at {module}@{offset:x}");
+                            let mut eexit_state = EXIT_STATE.write().map_err(|_| MutexError {})?;
+                            *eexit_state = ExitState::Crash;
+                            let _ = ptrace::kill(pid);
+                            return Ok(exit_code);
+                        }
+                    }
+                    for (target_module, target_addr) in NORMAL_ADDR {
+                        if module.ends_with(target_module) && offset == target_addr {
+                            log::debug!("[{pid}] normal exit {module}@{offset:x}");
+                            let mut eexit_state = EXIT_STATE.write().map_err(|_| MutexError {})?;
+                            *eexit_state = ExitState::Ok;
+                            let _ = ptrace::kill(pid);
+                            return Ok(exit_code);
+                        }
+                    }
+                    if !fix {
+                        log::debug!("[{pid}] Unknow addr {module}@{offset:x}");
                     }
                 }
                 ptrace::cont(pid, if fix { None } else { Some(Signal::SIGTRAP) })?;
@@ -129,12 +226,14 @@ fn debug(child: Pid, output_path: Option<PathBuf>, db: String) -> Result<i32> {
                 if signal == Signal::SIGSEGV {
                     let regs = ptrace::getregs(pid)?;
                     log::debug!("[{pid}] Stoped by {signal} rip: {:x}", regs.rip);
-                    let mut buf: String = String::new();
-                    std::fs::OpenOptions::new()
-                        .read(true)
-                        .open(format!("/proc/{pid}/maps"))?
-                        .read_to_string(&mut buf)?;
-                    log::trace!("{buf}");
+                    if log::log_enabled!(log::Level::Trace) {
+                        let mut buf: String = String::new();
+                        std::fs::OpenOptions::new()
+                            .read(true)
+                            .open(format!("/proc/{pid}/maps"))?
+                            .read_to_string(&mut buf)?;
+                        log::trace!("{buf}");
+                    }
                 } else {
                     log::debug!("[{pid}] Stoped by {signal}");
                 }
@@ -179,35 +278,7 @@ fn debug(child: Pid, output_path: Option<PathBuf>, db: String) -> Result<i32> {
             WaitStatus::StillAlive => {}
         }
     }
-    print_coverage(&record_map, &mut conn)?;
-
-    if let Some(output) = output_path {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(output)?;
-        serde_json::to_writer(file, &record_map)?;
-    }
     Ok(exit_code)
-}
-
-fn print_coverage(
-    record_map: &HashMap<String, HashSet<usize>>,
-    conn: &mut redis::Connection,
-) -> Result<()> {
-    for (module, bbs) in record_map {
-        let total_bb = conn.hvals::<_, Vec<String>>(module)?.len();
-        let trigger_bb = bbs.len();
-        log::info!(
-            "{}\t{}/{}\t{:.2}%",
-            module,
-            trigger_bb,
-            total_bb,
-            (trigger_bb as f32) / (total_bb as f32) * 100f32
-        );
-    }
-    Ok(())
 }
 
 fn get_module_and_offset(pid: Pid, addr: u64) -> Result<Option<(String, usize)>> {
