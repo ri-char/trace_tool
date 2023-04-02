@@ -22,7 +22,7 @@ enum Commands {
 #[derive(Args)]
 pub struct RunArgs {
     /// redis url
-    #[arg(long, default_value = "redis://127.0.0.1/", env="REDIS_URL")]
+    #[arg(long, default_value = "redis://127.0.0.1/", env = "REDIS_URL")]
     pub db: String,
     /// Command to run
     pub cmd: Vec<String>,
@@ -33,7 +33,7 @@ pub struct PatchArgs {
     /// File to be patched
     pub elf: String,
     /// redis url
-    #[arg(long, default_value = "redis://127.0.0.1/", env="REDIS_URL")]
+    #[arg(long, default_value = "redis://127.0.0.1/", env = "REDIS_URL")]
     pub db: String,
     /// r2 command
     #[arg(long, default_value = "r2")]

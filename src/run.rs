@@ -78,14 +78,14 @@ pub fn cmd_run(args: RunArgs) -> Result<()> {
     }
 }
 
-const ERROR_ADDR: [(&'static str, usize); 2] = [
+const ERROR_ADDR: [(&str, usize); 2] = [
     // KCrashHandler::TerminateHandler
     ("libkso.so", 0x03519150),
     // KCrashHandler::UnexpectedHandler
     ("libkso.so", 0x03519180),
 ];
 
-const NORMAL_ADDR: [(&'static str, usize); 2] = [
+const NORMAL_ADDR: [(&str, usize); 2] = [
     // KApplication::exec
     ("libetmain.so", 0x26b1266),
     // KxApplication::messageBox
