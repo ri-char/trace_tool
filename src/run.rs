@@ -7,7 +7,6 @@ use std::{
 };
 
 use anyhow::Result;
-use clap::__macro_refs::once_cell::sync::OnceCell;
 use nix::{
     libc::{close, open},
     sys::{
@@ -18,43 +17,49 @@ use nix::{
     },
     unistd::{alarm, execv, fork, ForkResult, Pid},
 };
+use once_cell::sync::OnceCell;
 use redis::Commands;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
 
-use crate::{
-    error::{MutexError, PtraceError},
-    RunArgs,
-};
+use crate::{procmaps, RunArgs};
 
-#[derive(serde::Deserialize, serde::Serialize, Clone, Copy)]
+#[derive(Deserialize, Serialize, Debug, Default)]
+struct RunResult {
+    map: HashMap<String, HashSet<usize>>,
+    state: ExitState,
+}
+
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Debug, Default)]
 enum ExitState {
+    #[default]
     Ok,
     Crash,
     Timeout,
+    Oom,
 }
 
-static RECORD_MAP: OnceCell<RwLock<HashMap<String, HashSet<usize>>>> = OnceCell::new();
-static EXIT_STATE: RwLock<ExitState> = RwLock::new(ExitState::Ok);
+static RUN_RESULT: OnceCell<RwLock<RunResult>> = OnceCell::new();
 
 pub fn cmd_run(args: RunArgs) -> Result<()> {
     let mut cstr_args: Vec<CString> = Vec::new();
     for arg in args.cmd {
         cstr_args.push(CString::new(arg)?)
     }
-    RECORD_MAP.get_or_init(|| RwLock::new(HashMap::new()));
+    RUN_RESULT.get_or_init(RwLock::default);
 
-    let sa = SigAction::new(
-        SigHandler::Handler(signal_handler),
+    let sa_timeout = SigAction::new(
+        SigHandler::Handler(signal_handler_timeout),
         SaFlags::SA_RESTART,
         SigSet::empty(),
     );
-
     unsafe {
-        sigaction(Signal::SIGALRM, &sa)?;
-        sigaction(Signal::SIGTERM, &sa)?;
+        sigaction(Signal::SIGALRM, &sa_timeout)?;
+        sigaction(Signal::SIGTERM, &sa_timeout)?;
     }
 
-    alarm::set(600);
+    if let Some(timeout) = args.timeout {
+        alarm::set(timeout);
+    }
 
     match unsafe { fork() }? {
         ForkResult::Parent { child } => {
@@ -78,11 +83,13 @@ pub fn cmd_run(args: RunArgs) -> Result<()> {
     }
 }
 
-const ERROR_ADDR: [(&str, usize); 2] = [
+const ERROR_ADDR: [(&str, usize); 3] = [
     // KCrashHandler::TerminateHandler
     ("libkso.so", 0x03519150),
     // KCrashHandler::UnexpectedHandler
     ("libkso.so", 0x03519180),
+    // KCrashHandler::SignalHandler
+    ("libkso.so", 0x35191b0),
 ];
 
 const NORMAL_ADDR: [(&str, usize); 2] = [
@@ -92,22 +99,13 @@ const NORMAL_ADDR: [(&str, usize); 2] = [
     ("libkso.so", 0x2891c40),
 ];
 
-extern "C" fn signal_handler(_: nix::libc::c_int) {
-    *EXIT_STATE.write().unwrap() = ExitState::Timeout;
+extern "C" fn signal_handler_timeout(_: nix::libc::c_int) {
+    RUN_RESULT.get().unwrap().write().unwrap().state = ExitState::Timeout;
     output_exit(0xff);
 }
 
 fn output_exit(code: i32) -> ! {
-    let eexit_state = *EXIT_STATE.read().unwrap();
-    let rrecord_map = &*RECORD_MAP.get().unwrap().read().unwrap();
-    serde_json::to_writer(
-        std::io::stdout(),
-        &json!({
-            "state": eexit_state,
-            "map": rrecord_map,
-        }),
-    )
-    .unwrap();
+    bincode::serialize_into(std::io::stdout(), RUN_RESULT.get().unwrap()).unwrap();
     exit(code);
 }
 
@@ -123,7 +121,7 @@ fn debug(child: Pid, db: &str) -> Result<i32> {
     if let WaitStatus::Stopped(_, Signal::SIGTRAP) = wait_status {
     } else {
         log::error!("Ptrace error");
-        return Err(PtraceError {}.into());
+        return Err(anyhow::anyhow!("ptrace spwan error"));
     }
     ptrace::setoptions(
         child,
@@ -149,6 +147,10 @@ fn debug(child: Pid, db: &str) -> Result<i32> {
             }
             WaitStatus::Signaled(pid, sig, _) => {
                 log::debug!("[{pid}] Exited with {sig}");
+                if sig == Signal::SIGKILL {
+                    RUN_RESULT.get().unwrap().write().unwrap().state = ExitState::Oom;
+                    output_exit(0xff);
+                }
                 active_pid.remove(&pid);
                 if pid == child {
                     exit_code = 0xff;
@@ -162,6 +164,32 @@ fn debug(child: Pid, db: &str) -> Result<i32> {
                 let mut reg = ptrace::getregs(pid)?;
                 reg.rip -= 1;
                 if let Some((module, offset)) = get_module_and_offset(pid, reg.rip)? {
+                    for (target_module, target_addr) in ERROR_ADDR {
+                        if module.ends_with(target_module) && offset == target_addr {
+                            log::debug!("[{pid}] crash at {module}@{offset:x}");
+                            let mut eexit_state = RUN_RESULT
+                                .get()
+                                .unwrap()
+                                .write()
+                                .map_err(|_| anyhow::anyhow!("ptrace swpan error"))?;
+                            eexit_state.state = ExitState::Crash;
+                            let _ = ptrace::kill(pid);
+                            return Ok(exit_code);
+                        }
+                    }
+                    for (target_module, target_addr) in NORMAL_ADDR {
+                        if module.ends_with(target_module) && offset == target_addr {
+                            log::debug!("[{pid}] normal exit {module}@{offset:x}");
+                            let mut eexit_state = RUN_RESULT
+                                .get()
+                                .unwrap()
+                                .write()
+                                .map_err(|_| anyhow::anyhow!("ptrace swpan error"))?;
+                            eexit_state.state = ExitState::Ok;
+                            let _ = ptrace::kill(pid);
+                            return Ok(exit_code);
+                        }
+                    }
                     if let Some(initial_byte) = get_initial_byte(&module, offset, &mut conn)? {
                         let aligned_ip = reg.rip & !7u64;
                         let mut code_bytes: [u8; 8] =
@@ -178,38 +206,20 @@ fn debug(child: Pid, db: &str) -> Result<i32> {
                             )
                         }?;
                         ptrace::setregs(pid, reg)?;
-                        let mut rrecord_map = RECORD_MAP
+                        let mut rrecord_map = RUN_RESULT
                             .get()
-                            .ok_or(MutexError {})?
+                            .ok_or(anyhow::anyhow!("ptrace swpan error"))?
                             .write()
-                            .map_err(|_| MutexError {})?;
+                            .map_err(|_| anyhow::anyhow!("ptrace swpan error"))?;
 
-                        if let Some(trigger_set) = (*rrecord_map).get_mut(&module) {
+                        if let Some(trigger_set) = rrecord_map.map.get_mut(&module) {
                             trigger_set.insert(offset);
                         } else {
                             let mut trigger_set = HashSet::new();
                             trigger_set.insert(offset);
-                            rrecord_map.insert(module.clone(), trigger_set);
+                            rrecord_map.map.insert(module.clone(), trigger_set);
                         }
                         fix = true;
-                    }
-                    for (target_module, target_addr) in ERROR_ADDR {
-                        if module.ends_with(target_module) && offset == target_addr {
-                            log::debug!("[{pid}] crash at {module}@{offset:x}");
-                            let mut eexit_state = EXIT_STATE.write().map_err(|_| MutexError {})?;
-                            *eexit_state = ExitState::Crash;
-                            let _ = ptrace::kill(pid);
-                            return Ok(exit_code);
-                        }
-                    }
-                    for (target_module, target_addr) in NORMAL_ADDR {
-                        if module.ends_with(target_module) && offset == target_addr {
-                            log::debug!("[{pid}] normal exit {module}@{offset:x}");
-                            let mut eexit_state = EXIT_STATE.write().map_err(|_| MutexError {})?;
-                            *eexit_state = ExitState::Ok;
-                            let _ = ptrace::kill(pid);
-                            return Ok(exit_code);
-                        }
                     }
                     if !fix {
                         log::debug!("[{pid}] Unknow addr {module}@{offset:x}");
@@ -282,7 +292,7 @@ fn debug(child: Pid, db: &str) -> Result<i32> {
 }
 
 fn get_module_and_offset(pid: Pid, addr: u64) -> Result<Option<(String, usize)>> {
-    let maps = procmaps::Mappings::from_pid(pid.as_raw())?;
+    let maps = procmaps::Mappings::from_pid(pid)?;
     let map = maps
         .iter()
         .find(|map| addr as usize >= map.base && map.ceiling > addr as usize);

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
-mod error;
 mod patch;
+mod procmaps;
 mod run;
 
 #[derive(Parser)]
@@ -26,6 +26,9 @@ pub struct RunArgs {
     pub db: String,
     /// Command to run
     pub cmd: Vec<String>,
+    /// max time
+    #[arg(long, default_value = "500")]
+    pub timeout: Option<u32>,
 }
 
 #[derive(Args)]

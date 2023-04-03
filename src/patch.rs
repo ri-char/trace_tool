@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::{error::R2Error, PatchArgs};
+use crate::PatchArgs;
 use anyhow::Result;
 use redis::Commands;
 
@@ -9,7 +9,7 @@ macro_rules! json_get_some {
         if let ::core::option::Option::Some(serde_json::Value::$jtype(var)) = $json {
             var
         } else {
-            return Err(R2Error {}.into());
+            return Err(anyhow::anyhow!("parse r2 response error"));
         }
     };
 }
@@ -19,7 +19,7 @@ macro_rules! json_get {
         if let serde_json::Value::$jtype(var) = $json {
             var
         } else {
-            return Err(R2Error {}.into());
+            return Err(anyhow::anyhow!("parse r2 response error"));
         }
     };
 }
@@ -51,7 +51,7 @@ pub fn cmd_patch(args: PatchArgs) -> Result<()> {
                 .and_then(|n| n.as_str())
                 .map_or(false, |s| s == ".text")
         })
-        .ok_or(R2Error {})?
+        .ok_or(anyhow::anyhow!("find .text error"))?
         .clone();
     let text_start = json_get_some!(sections.get("vaddr"), Number)
         .as_u64()

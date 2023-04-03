@@ -6,14 +6,15 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-nix ="0.26.2"
+nix ="*"
 anyhow="*"
-procmaps = "*"
+clap = {version="*", features=["derive", "env"]}
+r2pipe = "*"
+redis = "*"
+log = "*"
+env_logger = "*"
+bincode = "*"
 serde_json = "1"
 serde = {version="1", features=["derive"]}
-clap = {version="4", features=["derive", "env"]}
-r2pipe = "0.7.0"
-indicatif = "0.17.3"
-redis = "0.22.3"
-log = "0.4.17"
-env_logger = "0.10.0"
+once_cell = "1.17.1"
+nom = "7.1.3"
